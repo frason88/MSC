@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 from statsmodels.tsa.arima.model import ARIMA
-from statsmodels.tsa.stattools import acf
+from statsmodels.tsa.stattools import acf, adfuller, pacf
 import numpy as np
 import warnings
 
@@ -27,8 +27,6 @@ def load_data():
     return df
 
 df = load_data()
-
-
 
 # Define custom stopwords
 custom_stopwords = {'ishiwed', 'within', 'emitted', 'analyse', 'love', 'various', 'holds', 'needing', 'texts',
@@ -736,6 +734,7 @@ custom_stopwords = {'ishiwed', 'within', 'emitted', 'analyse', 'love', 'various'
                     'problem', 'well', 'good', 'part', 'form', 'think', 'specify', '0', 'also'}
 
 
+
 # Combine NLTK stopwords with custom stopwords
 stop_words = set(stopwords.words('english')).union(custom_stopwords)
 
@@ -771,8 +770,6 @@ comment_counts = df.groupby('year').size().reset_index(name='count')
 fig = px.line(comment_counts, x='year', y='count', title='Tutor Comments by Year')
 st.plotly_chart(fig)
 
-
-
 # Seasonality Analysis
 st.header('Seasonality Analysis: Pre-COVID vs Post-COVID')
 # Prepare monthly data
@@ -794,6 +791,7 @@ def prepare_monthly_data(data):
     return monthly_data
 pre_covid_monthly = prepare_monthly_data(df[~df['is_post_covid']])
 post_covid_monthly = prepare_monthly_data(df[df['is_post_covid']])
+
 fig = go.Figure()
 
 fig.add_trace(go.Scatter(
@@ -877,13 +875,21 @@ if search_word:
     word_trend = df.groupby('year').apply(
         lambda x: sum(1 for words in x['cleaned_text'] if search_word.lower() in words)).reset_index(name='count')
 
-    #  ACF
-    if len(word_trend) > 1:  # We need at least 2 data points for ACF
-        acf_values = acf(word_trend['count'], nlags=min(len(word_trend) - 1, 10))
+    # ADF Test
+    adf_result = adfuller(word_trend['count'])
+    st.write(f"ADF Statistic: {adf_result[0]}")
+    st.write(f"p-value: {adf_result[1]}")
+    st.write(f"Critical Values:")
+    for key, value in adf_result[4].items():
+        st.write(f"\t{key}: {value}")
+    if adf_result[1] > 0.05:
+        st.write("The time series is non-stationary (p-value > 0.05). Differencing is required.")
 
-        # Plot ACF
+    # ACF and PACF plots
+    if len(word_trend) > 2:  # We need at least 3 data points for ACF/PACF
         fig_acf = go.Figure()
-        fig_acf.add_trace(go.Bar(x=list(range(len(acf_values))), y=acf_values))  # Convert range to list
+        acf_values = acf(word_trend['count'], nlags=min(len(word_trend) - 1, 10))
+        fig_acf.add_trace(go.Bar(x=list(range(len(acf_values))), y=acf_values))
         fig_acf.add_hline(y=1.96 / np.sqrt(len(word_trend)), line_dash="dot", line_color="red")
         fig_acf.add_hline(y=-1.96 / np.sqrt(len(word_trend)), line_dash="dot", line_color="red")
         fig_acf.update_layout(title=f"Autocorrelation Function for '{search_word}'",
@@ -891,37 +897,60 @@ if search_word:
                               yaxis_title='Autocorrelation')
         st.plotly_chart(fig_acf)
 
+        fig_pacf = go.Figure()
+        pacf_values = pacf(word_trend['count'], nlags=min(len(word_trend) - 1, 4))
+        fig_pacf.add_trace(go.Bar(x=list(range(len(pacf_values))), y=pacf_values))
+        fig_pacf.update_layout(title=f"Partial Autocorrelation Function for '{search_word}'",
+                               xaxis_title='Lag',
+                               yaxis_title='Partial Autocorrelation')
+        st.plotly_chart(fig_pacf)
+
         st.write("""
-        The ACF plot shows the correlation between a time series and its lagged values.
-        Bars extending beyond the dotted red lines are statistically significant at the 95% confidence level.
-        This can help identify seasonality and the appropriate order for the ARIMA model.
+        The ACF plot helps identify the order of the MA component in ARIMA modeling. Significant spikes in the plot can suggest the presence of seasonality.
+        The PACF plot helps identify the order of the AR component in ARIMA modeling.
         """)
 
-    # Forecasting
-    if len(word_trend) > 2:
-        model = ARIMA(word_trend['count'], order=(1, 1, 1))
+        # Model Selection based on AIC/BIC
+        models = {}
+        orders = [(1, 1, 1), (2, 1, 1), (1, 1, 2), (2, 1, 2)]
+        for order in orders:
+            try:
+                model = ARIMA(word_trend['count'], order=order)
+                results = model.fit()
+                models[order] = (results.aic, results.bic)
+            except:
+                continue
+
+        st.write("Model selection results based on AIC and BIC:")
+        for order, (aic, bic) in models.items():
+            st.write(f"ARIMA{order}: AIC = {aic}, BIC = {bic}")
+
+        best_order = min(models, key=lambda x: models[x][0])  # Select the model with the lowest AIC
+        st.write(f"Best ARIMA model based on AIC: ARIMA{best_order}")
+
+        # Forecasting
+        model = ARIMA(word_trend['count'], order=best_order)
         results = model.fit()
 
-        # Forecast for the next 3 years
         forecast = results.forecast(steps=3)
         forecast_years = list(range(word_trend['year'].max() + 1, word_trend['year'].max() + 4))
 
-        fig = go.Figure()
+        fig_forecast = go.Figure()
 
         # Actual data
-        fig.add_trace(go.Scatter(x=word_trend['year'].tolist(), y=word_trend['count'].tolist(),
-                                 mode='lines+markers', name='Actual', line=dict(color='blue')))
+        fig_forecast.add_trace(go.Scatter(x=word_trend['year'].tolist(), y=word_trend['count'].tolist(),
+                                          mode='lines+markers', name='Actual', line=dict(color='blue')))
 
         # Forecasted data
-        fig.add_trace(go.Scatter(x=forecast_years, y=forecast.tolist(),
-                                 mode='lines+markers', name='Forecast', line=dict(color='red', dash='dash')))
+        fig_forecast.add_trace(go.Scatter(x=forecast_years, y=forecast.tolist(),
+                                          mode='lines+markers', name='Forecast', line=dict(color='red', dash='dash')))
 
-        fig.update_layout(title=f"Trend and Forecast of '{search_word}'",
-                          xaxis_title='Year',
-                          yaxis_title='Count',
-                          legend_title_text='Data')
+        fig_forecast.update_layout(title=f"Trend and Forecast of '{search_word}'",
+                                   xaxis_title='Year',
+                                   yaxis_title='Count',
+                                   legend_title_text='Data')
 
-        st.plotly_chart(fig)
+        st.plotly_chart(fig_forecast)
 
         st.write("""
         The blue line represents the actual trend of the word usage over the years.
@@ -930,135 +959,3 @@ if search_word:
         """)
     else:
         st.write("Not enough data points for forecasting. The word needs to appear in at least 3 different years.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
